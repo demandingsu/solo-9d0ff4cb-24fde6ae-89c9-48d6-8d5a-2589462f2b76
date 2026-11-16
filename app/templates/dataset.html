@@ -22,11 +22,17 @@
       <div class="stat"><span class="k">分段</span><span class="v">{{ result.segments|length }}</span></div>
       <div class="stat"><span class="k">已校时</span><span class="v">{{ result.rows|length }}</span></div>
       <div class="stat {{ 'warn' if result.pending }}"><span class="k">待核</span><span class="v">{{ result.pending|length }}</span></div>
+      <div class="stat {{ 'warn' if result.excluded }}"><span class="k">隔离</span><span class="v">{{ result.excluded|length }}</span></div>
       <div class="stat"><span class="k">当前发布版本</span><span class="v">{% if latest %}第 {{ latest.revision }} 版{% else %}未发布{% endif %}</span></div>
     </div>
     {% if result.orphan_anchors %}
       <div class="flash warn">有 {{ result.orphan_anchors|length }} 个锚点的序号在读数中不存在：
         {% for a in result.orphan_anchors %}{{ a.seq }}（{{ a.utc.strftime('%Y-%m-%dT%H:%M:%SZ') }}）{{ '、' if not loop.last }}{% endfor %}；已忽略。
+      </div>
+    {% endif %}
+    {% if result.disabled_anchors %}
+      <div class="flash warn">有 {{ result.disabled_anchors|length }} 个锚点落在隔离读数上，已停用、不参与校时：
+        {% for a in result.disabled_anchors %}序号 {{ a.seq }}{{ '、' if not loop.last }}{% endfor %}；锚点记录仍保留，撤销隔离后自动恢复有效。
       </div>
     {% endif %}
   </section>
@@ -59,6 +65,52 @@
       {% endfor %}
       </tbody>
     </table>
+  </section>
+
+  <section class="panel">
+    <h2>读数隔离（质控）</h2>
+    <p class="muted">
+      探头清洗等原因导致的失真读数可按<strong>原始序号</strong>隔离并填写原因。隔离读数不进入 UTC 日文件和待核文件，
+      其锚点也不参与校时；原始 CSV 与锚点记录始终保留。回拨分段仍依据完整原始序列切分，剩余读数只在各自分段内、
+      用有效锚点重算，不会因为排除读数而跨段插值。每次隔离或撤销都会整版重新发布，失败则整次操作回滚、旧版链接仍下载原内容。
+    </p>
+    <form method="post" action="/datasets/{{ dataset.id }}/exclusions" class="inline-form">
+      <label>原始序号
+        <input type="number" name="seq" min="1" step="1" required placeholder="例如 24">
+      </label>
+      <label class="grow">隔离原因
+        <input type="text" name="reason" maxlength="300" required placeholder="例如：探头清洗，溶氧读数失真">
+      </label>
+      <button type="submit" class="primary">隔离并重新发布</button>
+    </form>
+
+    {% if result.excluded %}
+    <h3>当前隔离项（{{ result.excluded|length }} 条）</h3>
+    <table class="grid">
+      <thead><tr><th>原始序号</th><th>设备时间</th><th>溶氧</th><th>所属分段</th><th>隔离原因</th><th>隔离时间 (UTC)</th><th>锚点</th><th></th></tr></thead>
+      <tbody>
+      {% for x in result.excluded %}
+        <tr class="row-excluded">
+          <td>{{ x.seq }}</td>
+          <td class="mono">{{ x.device_time.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="mono">{{ '%.2f'|format(x.dissolved_oxygen) }}</td>
+          <td>{{ x.segment + 1 }}</td>
+          <td>{{ x.reason }}</td>
+          <td class="mono">{{ x.isolated_at or '' }}</td>
+          <td>{% if x.has_anchor %}<span class="tag warn-tag">已停用</span>{% else %}<span class="muted">无</span>{% endif %}</td>
+          <td>
+            <form method="post" action="/datasets/{{ dataset.id }}/exclusions/{{ x.seq }}/restore"
+                  onsubmit="return confirm('确认撤销序号 {{ x.seq }} 的隔离？将按原始数据重新生成发布版本。');">
+              <button type="submit" class="small secondary">撤销隔离并重新发布</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="ok-text">当前没有隔离读数。</p>
+    {% endif %}
   </section>
 
   <section class="panel">
@@ -109,7 +161,8 @@
     <h2>当日发布目录（第 {% if latest %}{{ latest.revision }}{% else %}—{% endif %} 版）</h2>
     {% if latest %}
       <p class="muted">
-        发布于 {{ latest.created_at }}；锚点 {{ latest.anchor_count }} 个，已校时 {{ latest.dated_count }} 条，待核 {{ latest.pending_count }} 条。
+        发布于 {{ latest.created_at }}；锚点 {{ latest.anchor_count }} 个，已校时 {{ latest.dated_count }} 条，
+        待核 {{ latest.pending_count }} 条，隔离 {{ latest.excluded_count }} 条。
         文件一经发布不再改写，本页所有链接都固定指向这一版。
       </p>
       <table class="grid">
@@ -133,6 +186,14 @@
             <td class="mono sha">{{ (files|selectattr('kind','equalto','pending')|list)[0].sha256 if files|selectattr('kind','equalto','pending')|list else '' }}</td>
             <td><a class="button small" href="/p/{{ latest.id }}/pending.csv">下载</a></td>
           </tr>
+          {% set excluded_file = files|selectattr('kind','equalto','excluded')|list %}
+          <tr class="{{ 'row-excluded' if excluded_file }}">
+            <td>—</td>
+            <td class="mono">excluded.csv（隔离记录）</td>
+            <td>{% if excluded_file %}{{ excluded_file[0].size }}{% else %}<span class="muted">无隔离项</span>{% endif %}</td>
+            <td class="mono sha">{% if excluded_file %}{{ excluded_file[0].sha256 }}{% endif %}</td>
+            <td>{% if excluded_file %}<a class="button small" href="/p/{{ latest.id }}/excluded.csv">下载</a>{% endif %}</td>
+          </tr>
           <tr>
             <td>—</td>
             <td class="mono">manifest.csv（清单）</td>
@@ -149,7 +210,7 @@
 
   <section class="panel">
     <h2>已校时读数（按 UTC 升序）</h2>
-    <p class="muted">溶氧列始终是原始值；UTC 列是校时结果，仅用于导出，不写回原始读数。</p>
+    <p class="muted">溶氧列始终是原始值；UTC 列是校时结果，仅用于导出，不写回原始读数。隔离读数不在此表，也不在日文件中。</p>
     <div class="tablewrap">
       <table class="grid">
         <thead><tr><th>序号</th><th>设备时间</th><th>溶氧</th><th>UTC</th><th>UTC 日</th><th>段</th><th>来源</th></tr></thead>
@@ -173,6 +234,7 @@
   {% if result.pending %}
   <section class="panel">
     <h2>待核读数</h2>
+    <p class="muted">待核文件只包含因锚点不足而无法定日的读数；隔离读数不属于待核，不会出现在 pending.csv。</p>
     <table class="grid">
       <thead><tr><th>序号</th><th>设备时间</th><th>溶氧</th><th>段</th></tr></thead>
       <tbody>
@@ -193,7 +255,7 @@
     <h2>发布历史</h2>
     {% if publications %}
       <table class="grid">
-        <thead><tr><th>版本</th><th>发布时间 (UTC)</th><th>锚点</th><th>已校时</th><th>待核</th><th>文件</th></tr></thead>
+        <thead><tr><th>版本</th><th>发布时间 (UTC)</th><th>锚点</th><th>已校时</th><th>待核</th><th>隔离</th><th>文件</th></tr></thead>
         <tbody>
         {% for p in publications %}
           <tr class="{{ 'row-current' if latest and p.id == latest.id }}">
@@ -202,6 +264,7 @@
             <td>{{ p.anchor_count }}</td>
             <td>{{ p.dated_count }}</td>
             <td>{{ p.pending_count }}</td>
+            <td>{{ p.excluded_count }}</td>
             <td>
               <a class="button small" href="/p/{{ p.id }}/manifest.csv">清单</a>
               <a class="button small" href="/p/{{ p.id }}/pending.csv">待核</a>
@@ -217,7 +280,7 @@
   </section>
 </main>
 <footer class="foot">
-  <span>原始读数只读</span>·<span>发布过程原子替换，失败保留旧版</span>·<span>旧版链接内容不变</span>
+  <span>原始读数只读</span>·<span>隔离不删原始数据</span>·<span>发布过程原子替换，失败保留旧版</span>·<span>旧版链接内容不变</span>
 </footer>
 </body>
 </html>

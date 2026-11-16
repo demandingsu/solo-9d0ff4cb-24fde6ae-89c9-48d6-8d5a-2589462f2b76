@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import core, demo
-from .service import DatasetNotFound, NoPublication, Service
+from .service import DatasetNotFound, IsolationError, NoPublication, Service
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("WQ_DATA_DIR", BASE_DIR.parent / "var"))
@@ -103,6 +103,7 @@ def _state_context(
     return {
         "dataset": state.dataset,
         "result": state.result,
+        "exclusions": state.exclusions,
         "latest": latest,
         "publications": state.publications,
         "files": files,
@@ -306,6 +307,94 @@ def republish(request: Request, dataset_id: int):
     return RedirectResponse(f"/datasets/{dataset_id}", status_code=303)
 
 
+def _parse_seq(text: str) -> int:
+    raw = (text or "").strip()
+    if not raw:
+        raise core.InputError("请填写要隔离的原始序号")
+    try:
+        seq = int(raw)
+    except ValueError:
+        raise core.InputError(f"序号必须是正整数：{raw!r}") from None
+    if seq <= 0:
+        raise core.InputError(f"序号必须是正整数：{seq}")
+    return seq
+
+
+@app.post("/datasets/{dataset_id}/exclusions")
+def isolate_reading(request: Request, dataset_id: int, seq: str = Form(""),
+                     reason: str = Form("")):
+    try:
+        get_service().dataset(dataset_id)
+    except DatasetNotFound as exc:
+        return _page(request, "message.html", {"message": str(exc)}, status_code=404)
+
+    try:
+        seq_value = _parse_seq(seq)
+        # validate the reason before opening the publish transaction
+        reason_value = core.normalize_reason(reason)
+    except core.InputError as exc:
+        return _render_dataset(request, dataset_id, error=exc.as_text(),
+                               status_code=400)
+
+    try:
+        publication = get_service().isolate_and_publish(
+            dataset_id, seq_value, reason_value
+        )
+    except IsolationError as exc:
+        return _render_dataset(request, dataset_id, error=str(exc), status_code=400)
+    except DatasetNotFound as exc:
+        return _page(request, "message.html", {"message": str(exc)}, status_code=404)
+    except Exception as exc:
+        return _render_dataset(
+            request,
+            dataset_id,
+            error=f"隔离失败，未发布新版本，仍使用旧版：{exc}",
+            status_code=500,
+        )
+    return _render_dataset(
+        request,
+        dataset_id,
+        notice=(
+            f"已隔离序号 {seq_value} 并发布第 {publication.revision} 版；"
+            "该读数不进入日文件和待核文件，原始 CSV 与锚点记录保留。"
+        ),
+    )
+
+
+@app.post("/datasets/{dataset_id}/exclusions/{seq}/restore")
+def restore_reading(request: Request, dataset_id: int, seq: int):
+    try:
+        get_service().dataset(dataset_id)
+    except DatasetNotFound as exc:
+        return _page(request, "message.html", {"message": str(exc)}, status_code=404)
+
+    if seq <= 0:
+        return _render_dataset(
+            request, dataset_id, error=f"序号必须是正整数：{seq}", status_code=400
+        )
+    try:
+        publication = get_service().restore_and_publish(dataset_id, seq)
+    except IsolationError as exc:
+        return _render_dataset(request, dataset_id, error=str(exc), status_code=400)
+    except DatasetNotFound as exc:
+        return _page(request, "message.html", {"message": str(exc)}, status_code=404)
+    except Exception as exc:
+        return _render_dataset(
+            request,
+            dataset_id,
+            error=f"撤销隔离失败，未发布新版本，仍使用旧版：{exc}",
+            status_code=500,
+        )
+    return _render_dataset(
+        request,
+        dataset_id,
+        notice=(
+            f"已撤销序号 {seq} 的隔离，并按原始数据重新生成第 "
+            f"{publication.revision} 版。"
+        ),
+    )
+
+
 @app.post("/demo")
 def load_demo():
     ds = demo.seed(get_service())
@@ -351,6 +440,11 @@ def download_day(request: Request, publication_id: int, date: str):
 @app.get("/p/{publication_id}/pending.csv")
 def download_pending(request: Request, publication_id: int):
     return _download(request, publication_id, "pending", None, "待核读数.csv")
+
+
+@app.get("/p/{publication_id}/excluded.csv")
+def download_excluded(request: Request, publication_id: int):
+    return _download(request, publication_id, "excluded", None, "隔离读数.csv")
 
 
 @app.get("/p/{publication_id}/manifest.csv")

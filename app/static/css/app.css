@@ -75,7 +75,7 @@ pre.code {
 
 .stack { display: flex; flex-direction: column; gap: 12px; }
 label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
-input[type=text], input[type=file], textarea {
+input[type=text], input[type=number], input[type=file], textarea {
   border: 1px solid var(--line);
   border-radius: 7px;
   padding: 8px 10px;
@@ -84,6 +84,17 @@ input[type=text], input[type=file], textarea {
 }
 textarea { font-family: var(--mono); font-size: 13px; resize: vertical; }
 input[type=file] { padding: 6px; background: #f8fafc; }
+
+.inline-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 10px 0 16px;
+}
+.inline-form label { min-width: 180px; }
+.inline-form label.grow { flex: 1 1 280px; }
+.inline-form button { white-space: nowrap; }
 
 .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
@@ -122,6 +133,7 @@ table.grid th, table.grid td { padding: 6px 9px; border-bottom: 1px solid var(--
 table.grid th { background: #f1f5f9; color: #334155; font-weight: 600; position: sticky; top: 0; }
 table.grid tr.row-warn { background: #fffbeb; }
 table.grid tr.row-current { background: #eff6ff; }
+table.grid tr.row-excluded { background: var(--error-bg); }
 .tablewrap { max-height: 460px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .sha { word-break: break-all; color: var(--muted); font-size: 11.5px; max-width: 260px; }
 
@@ -137,6 +149,7 @@ table.grid tr.row-current { background: #eff6ff; }
 }
 .tag.anchor { background: #e0f2fe; border-color: #bae6fd; color: #075985; }
 .tag.seq { background: #fff7ed; border-color: #fed7aa; color: #9a3412; }
+.tag.warn-tag { background: var(--error-bg); border-color: #fecaca; color: var(--error); }
 .ok-text { color: var(--ok); }
 .warn-text { color: var(--warn); }
 

@@ -16,6 +16,12 @@ swept on the next startup.  The raw readings are never touched by any of this.
 A submission that adds anchors is a *single* transaction.  In particular a
 rejected anchor (same sequence number, different UTC) rolls back the whole
 submission, so the page never shows a mixture of old and new anchors.
+
+An isolation (or the lifting of one) follows the same protocol: the
+``exclusion`` row change and the new publication snapshot are committed in one
+transaction.  When the isolation interleaves with supplementary anchors, the
+page state, the correction result and every download link therefore always
+describe the same committed revision.
 """
 
 from __future__ import annotations
@@ -44,11 +50,16 @@ class NoPublication(ServiceError):
     pass
 
 
+class IsolationError(ServiceError):
+    """A quarantine request is invalid (unknown seq, already isolated ...)."""
+
+
 @dataclass
 class DatasetState:
     dataset: Dataset
     result: core.CorrectionResult
     anchors: list[core.AnchorInput]
+    exclusions: list
     latest: Publication | None
     publications: list[Publication]
 
@@ -106,11 +117,20 @@ class Service:
         ds = self.dataset(dataset_id)
         readings = self.store.readings(dataset_id)
         anchors = self.store.anchors(dataset_id)
-        result = core.correct(readings, anchors)
+        exclusion_records = self.store.exclusions(dataset_id)
+        result = core.correct(
+            readings,
+            anchors,
+            [
+                core.Exclusion(r.seq, r.reason, r.created_at)
+                for r in exclusion_records
+            ],
+        )
         return DatasetState(
             dataset=ds,
             result=result,
             anchors=anchors,
+            exclusions=exclusion_records,
             latest=self.store.latest_publication(dataset_id),
             publications=self.store.publications(dataset_id),
         )
@@ -179,6 +199,49 @@ class Service:
                 return self._publish_in(conn, dataset_id)
 
     # ------------------------------------------------------------------
+    # quality-control isolation
+    # ------------------------------------------------------------------
+
+    def _known_seqs(self, conn, dataset_id: int) -> set[int]:
+        return {r.seq for r in self.store.readings(dataset_id, conn)}
+
+    def isolate_and_publish(
+        self, dataset_id: int, seq: int, reason: str
+    ) -> Publication:
+        """Isolate one reading with a reason, then republish atomically.
+
+        The exclusion row and the new publication are committed in one
+        transaction: a file-write or registration failure rolls the exclusion
+        back too, so the page can never show an isolated reading whose files
+        were not republished (or vice versa).  The raw CSV and the anchor row
+        are never modified.
+        """
+        self.dataset(dataset_id)
+        reason = core.normalize_reason(reason)
+        with self._publish_lock:
+            with self.store.transaction() as conn:
+                seqs = self._known_seqs(conn, dataset_id)
+                if seq not in seqs:
+                    raise IsolationError(f"序号 {seq} 不在本批次的原始读数中")
+                if self.store.get_exclusion(conn, dataset_id, seq) is not None:
+                    raise IsolationError(f"序号 {seq} 已处于隔离状态")
+                self.store.insert_exclusion(conn, dataset_id, seq, reason)
+                return self._publish_in(conn, dataset_id)
+
+    def restore_and_publish(self, dataset_id: int, seq: int) -> Publication:
+        """Lift one isolation and regenerate the publication from raw data."""
+        self.dataset(dataset_id)
+        with self._publish_lock:
+            with self.store.transaction() as conn:
+                seqs = self._known_seqs(conn, dataset_id)
+                if seq not in seqs:
+                    raise IsolationError(f"序号 {seq} 不在本批次的原始读数中")
+                if self.store.get_exclusion(conn, dataset_id, seq) is None:
+                    raise IsolationError(f"序号 {seq} 未被隔离，无需撤销")
+                self.store.delete_exclusion(conn, dataset_id, seq)
+                return self._publish_in(conn, dataset_id)
+
+    # ------------------------------------------------------------------
     # publish internals
     # ------------------------------------------------------------------
 
@@ -193,7 +256,15 @@ class Service:
         """
         readings = self.store.readings(dataset_id, conn)
         anchors = self.store.anchors(dataset_id, conn)
-        result = core.correct(readings, anchors)
+        exclusion_records = self.store.exclusions(dataset_id, conn)
+        result = core.correct(
+            readings,
+            anchors,
+            [
+                core.Exclusion(r.seq, r.reason, r.created_at)
+                for r in exclusion_records
+            ],
+        )
         result.generated_at = datetime.now(timezone.utc)
         latest = self.store.latest_publication(dataset_id, conn)
         revision = (latest.revision + 1) if latest else 1

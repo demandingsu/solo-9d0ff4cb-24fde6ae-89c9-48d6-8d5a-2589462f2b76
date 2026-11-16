@@ -14,6 +14,11 @@ What is stored
 ``anchor``
     the 核时锚点 rows keyed by ``(dataset_id, seq)``.  A sequence number can
     only ever have one UTC value per dataset.
+``exclusion``
+    quality-control isolations keyed by ``(dataset_id, seq)`` with the
+    operator-supplied reason.  The raw reading and any anchor on the same
+    sequence are both retained; the exclusion only removes the reading from
+    the correction and its anchor from the usable anchor set.
 ``publication`` / ``published_file``
     an immutable snapshot of the derived CSV tree.
 
@@ -69,6 +74,14 @@ CREATE TABLE IF NOT EXISTS anchor (
     PRIMARY KEY (dataset_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS exclusion (
+    dataset_id   INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS publication (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     dataset_id  INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,
@@ -77,6 +90,7 @@ CREATE TABLE IF NOT EXISTS publication (
     anchor_count INTEGER NOT NULL,
     dated_count INTEGER NOT NULL,
     pending_count INTEGER NOT NULL,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (dataset_id, revision)
 );
 
@@ -118,6 +132,14 @@ class Publication:
     anchor_count: int
     dated_count: int
     pending_count: int
+    excluded_count: int = 0
+
+
+@dataclass(frozen=True)
+class ExclusionRecord:
+    seq: int
+    reason: str
+    created_at: str
 
 
 def now_iso() -> str:
@@ -130,7 +152,8 @@ def _iso(value: str) -> datetime:
 
 _DATASET_COLS = "id, name, created_at, source_rows, raw_path, raw_sha256"
 _PUB_COLS = (
-    "id, dataset_id, revision, created_at, anchor_count, dated_count, pending_count"
+    "id, dataset_id, revision, created_at, anchor_count, dated_count,"
+    " pending_count, excluded_count"
 )
 _FILE_COLS = "id, publication_id, day, kind, relpath, sha256, size"
 
@@ -144,6 +167,23 @@ class Store:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Bring older databases up to the current schema.
+
+        Additive only: historical publications and their files are untouched,
+        so links handed out before an upgrade keep downloading the same bytes.
+        """
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(publication)").fetchall()
+        }
+        if "excluded_count" not in cols:
+            conn.execute(
+                "ALTER TABLE publication ADD COLUMN"
+                " excluded_count INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------
     # connections
@@ -293,6 +333,58 @@ class Store:
         return added
 
     # ------------------------------------------------------------------
+    # quality-control exclusions
+    # ------------------------------------------------------------------
+
+    def exclusions(
+        self, dataset_id: int, conn: sqlite3.Connection | None = None
+    ) -> list[ExclusionRecord]:
+        sql = (
+            "SELECT seq, reason, created_at FROM exclusion"
+            " WHERE dataset_id=? ORDER BY seq"
+        )
+        if conn is None:
+            with self.connect() as own:
+                rows = own.execute(sql, (dataset_id,)).fetchall()
+        else:
+            rows = conn.execute(sql, (dataset_id,)).fetchall()
+        return [ExclusionRecord(r["seq"], r["reason"], r["created_at"]) for r in rows]
+
+    def get_exclusion(
+        self, conn: sqlite3.Connection, dataset_id: int, seq: int
+    ) -> ExclusionRecord | None:
+        row = conn.execute(
+            "SELECT seq, reason, created_at FROM exclusion"
+            " WHERE dataset_id=? AND seq=?",
+            (dataset_id, seq),
+        ).fetchone()
+        return ExclusionRecord(row["seq"], row["reason"], row["created_at"]) if row else None
+
+    def insert_exclusion(
+        self,
+        conn: sqlite3.Connection,
+        dataset_id: int,
+        seq: int,
+        reason: str,
+        created_at: str | None = None,
+    ) -> None:
+        """Record one isolation inside an existing transaction."""
+        conn.execute(
+            "INSERT INTO exclusion(dataset_id, seq, reason, created_at)"
+            " VALUES (?,?,?,?)",
+            (dataset_id, seq, reason, created_at or now_iso()),
+        )
+
+    def delete_exclusion(
+        self, conn: sqlite3.Connection, dataset_id: int, seq: int
+    ) -> None:
+        """Lift one isolation inside an existing transaction."""
+        conn.execute(
+            "DELETE FROM exclusion WHERE dataset_id=? AND seq=?",
+            (dataset_id, seq),
+        )
+
+    # ------------------------------------------------------------------
     # publications
     # ------------------------------------------------------------------
 
@@ -363,15 +455,24 @@ class Store:
         dataset_id: int,
         revision: int,
         files: list[tuple[str, str | None, str, str, int]],
-        counts: tuple[int, int, int],
+        counts: tuple[int, int, int, int],
         created_at: str | None = None,
     ) -> Publication:
         stamp = created_at or now_iso()
-        anchor_count, dated_count, pending_count = counts
+        anchor_count, dated_count, pending_count, excluded_count = counts
         cur = conn.execute(
             "INSERT INTO publication(dataset_id, revision, created_at,"
-            " anchor_count, dated_count, pending_count) VALUES (?,?,?,?,?,?)",
-            (dataset_id, revision, stamp, anchor_count, dated_count, pending_count),
+            " anchor_count, dated_count, pending_count, excluded_count)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                dataset_id,
+                revision,
+                stamp,
+                anchor_count,
+                dated_count,
+                pending_count,
+                excluded_count,
+            ),
         )
         publication_id = int(cur.lastrowid)
         conn.executemany(
@@ -390,4 +491,5 @@ class Store:
             anchor_count,
             dated_count,
             pending_count,
+            excluded_count,
         )

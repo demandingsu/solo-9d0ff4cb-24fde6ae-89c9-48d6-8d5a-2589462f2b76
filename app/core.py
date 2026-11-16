@@ -9,12 +9,22 @@ Vocabulary
 segment
     A maximal run of readings whose *device* timestamps are strictly
     increasing.  A non-increasing device timestamp starts a new segment.
+    Segmentation always uses the **complete original sequence**; isolating a
+    reading never removes it from the sequence and never merges segments.
 anchor
     A row from a 核时锚点 CSV: ``(序号, UTC)``.  An anchor pins the reading
-    with that sequence number to the given UTC instant.
+    with that sequence number to the given UTC instant.  An anchor whose
+    reading has been isolated is kept on record but never used for correction.
 pending (待核)
-    A reading that cannot be dated: it lies in a segment that has no anchor,
-    or it lies outside the range covered by the anchors of its segment.
+    A reading that cannot be dated: it lies in a segment that has no usable
+    anchor, or it lies outside the range covered by the usable anchors of its
+    segment.
+isolated (隔离)
+    A reading quarantined by the quality controller (e.g. a distorted
+    dissolved-oxygen value taken while the probe was being cleaned).  It stays
+    in the raw CSV and keeps its sequence number, but never enters a UTC day
+    file or the pending file, and an anchor on its sequence cannot be used to
+    date anything else.
 """
 
 from __future__ import annotations
@@ -320,22 +330,56 @@ class CorrectedRow:
         return utc_date(self.utc)
 
 
+@dataclass(frozen=True)
+class ExcludedReading:
+    """A reading isolated by quality control.
+
+    The reason text is operator supplied; the reading itself is the original
+    parsed row, so the quarantine is fully auditable.
+    """
+
+    seq: int
+    device_time: datetime
+    dissolved_oxygen: float
+    reason: str
+    segment: int
+    has_anchor: bool  # an anchor exists for the seq but is kept unusable
+    isolated_at: str | None = None
+
+    @property
+    def date(self) -> str | None:
+        """UTC day of the *device* timestamp, for display only.
+
+        Isolated readings have no corrected UTC, so this is never used to place
+        them in a day file.
+        """
+        return utc_date(self.device_time)
+
+
 @dataclass
 class CorrectionResult:
     readings: list[Reading]
     segments: list[Segment]
     rows: list[CorrectedRow]
     pending: list[Reading]
+    # readings removed from the correction by quality control
+    excluded: list[ExcludedReading] = field(default_factory=list)
     # anchors whose sequence number is absent from the readings
     orphan_anchors: list[AnchorInput] = field(default_factory=list)
     # anchors present in the file but not usable (duplicates with another UTC)
     conflicts: list[str] = field(default_factory=list)
+    # anchors that exist but cannot be used because their reading is isolated
+    disabled_anchors: list[AnchorInput] = field(default_factory=list)
     # wall clock of the correction run, used in the manifest
     generated_at: datetime | None = None
 
     @property
     def pending_seqs(self) -> list[int]:
         return [r.seq for r in self.pending]
+
+    @property
+    def excluded_seqs(self) -> list[int]:
+        return [r.seq for r in self.excluded]
 
     def dates(self) -> list[str]:
         return sorted({row.date for row in self.rows})
@@ -351,8 +395,19 @@ class CorrectionResult:
         return -1
 
 
+@dataclass(frozen=True)
+class Exclusion:
+    """An isolation instruction for one sequence number."""
+
+    seq: int
+    reason: str
+    isolated_at: str | None = None
+
+
 def correct(
-    readings: Sequence[Reading], anchors: Sequence[AnchorInput]
+    readings: Sequence[Reading],
+    anchors: Sequence[AnchorInput],
+    exclusions: Sequence[Exclusion] = (),
 ) -> CorrectionResult:
     """Apply the clock correction.
 
@@ -360,18 +415,33 @@ def correct(
     -----
     * An anchor fixes the reading with the same sequence number to the given
       UTC instant.
-    * A segment with two or more anchors is corrected between its first and
-      its last anchor by linear interpolation over device time.  Readings
-      before the first / after the last anchor of such a segment have no
-      reference and stay pending.
-    * A segment with fewer than two anchors is entirely pending, except that
-      the single anchored reading itself is dated by its own anchor.
+    * A segment with two or more *usable* anchors is corrected between its
+      first and its last usable anchor by linear interpolation over device
+      time.  Readings before the first / after the last anchor of such a
+      segment have no reference and stay pending.
+    * A segment with fewer than two usable anchors is entirely pending, except
+      that the single anchored reading itself is dated by its own anchor.
     * An anchor naming a sequence number absent from the readings is reported
       and ignored.
+    * Segmentation is computed from the **complete original sequence**,
+      including isolated readings: an excluded reading still marks a clock
+      rollback boundary.  It is only skipped afterwards, so removing one can
+      never join two segments into one and can never create an interpolation
+      that crosses a segment boundary.
+    * An isolated reading is never dated and never pending: it is reported in
+      ``excluded`` and kept out of every export except the quarantine record.
+      An anchor on its sequence is retained but disabled and reported in
+      ``disabled_anchors``; it cannot anchor or bound an interpolation.
     """
     readings = sorted(readings, key=lambda r: r.seq)
-    segments = split_segments(readings)
     by_seq: dict[int, Reading] = {r.seq: r for r in readings}
+    exclusion_by_seq: dict[int, Exclusion] = {}
+    for exclusion in exclusions:
+        if exclusion.seq in by_seq and exclusion.seq not in exclusion_by_seq:
+            exclusion_by_seq[exclusion.seq] = exclusion
+
+    # full-sequence segmentation, before any reading is hidden
+    segments = split_segments(readings)
     seg_of_seq: dict[int, Segment] = {
         r.seq: seg for seg in segments for r in seg.readings
     }
@@ -391,12 +461,39 @@ def correct(
         if anchor.seq not in by_seq:
             result.orphan_anchors.append(anchor)
 
+    # anchors on isolated readings are kept on record but never used
+    usable_anchors: dict[int, AnchorInput] = {}
+    for seq, anchor in anchor_by_seq.items():
+        if seq in exclusion_by_seq:
+            result.disabled_anchors.append(anchor)
+        else:
+            usable_anchors[seq] = anchor
+
+    # the quarantine report, in sequence order
+    for seq in sorted(exclusion_by_seq):
+        exclusion = exclusion_by_seq[seq]
+        reading = by_seq[seq]
+        result.excluded.append(
+            ExcludedReading(
+                reading.seq,
+                reading.device_time,
+                reading.dissolved_oxygen,
+                exclusion.reason,
+                seg_of_seq[seq].index,
+                has_anchor=seq in anchor_by_seq,
+                isolated_at=exclusion.isolated_at,
+            )
+        )
+
     dated: dict[int, CorrectedRow] = {}
     for seg in segments:
         seg.anchors = sorted(
-            (a for a in anchor_by_seq.values() if seg_of_seq.get(a.seq) is seg),
+            (a for a in usable_anchors.values() if seg_of_seq.get(a.seq) is seg),
             key=lambda a: by_seq[a.seq].device_time,
         )
+        # the excluded reading is hidden from interpolation, but the segment
+        # itself was cut from the full original sequence
+        seg_readings = [r for r in seg.readings if r.seq not in exclusion_by_seq]
         if len(seg.anchors) == 1:
             only = seg.anchors[0]
             reading = by_seq[only.seq]
@@ -410,7 +507,7 @@ def correct(
             r_right = by_seq[right.seq]
             span = (r_right.device_time - r_left.device_time).total_seconds()
             utc_span = (right.utc - left.utc).total_seconds()
-            for reading in seg.readings:
+            for reading in seg_readings:
                 if not (
                     r_left.device_time <= reading.device_time <= r_right.device_time
                 ):
@@ -439,8 +536,10 @@ def correct(
                     )
 
     result.rows = sorted(dated.values(), key=lambda r: (r.utc, r.seq))
-    # pending keeps the original file order
-    result.pending = [r for r in readings if r.seq not in dated]
+    # pending keeps the original file order; isolated readings are not pending
+    result.pending = [
+        r for r in readings if r.seq not in dated and r.seq not in exclusion_by_seq
+    ]
     return result
 
 
@@ -470,3 +569,33 @@ def format_do(value: float) -> str:
 
 CORRECTED_HEADER = ["序号", "设备时间", "溶氧", "UTC", "分段", "来源"]
 PENDING_HEADER = ["序号", "设备时间", "溶氧", "分段"]
+# quarantine export: isolated readings never appear in day / pending files,
+# but their own audit record keeps the original values and the operator reason
+EXCLUDED_HEADER = ["序号", "设备时间", "溶氧", "分段", "隔离原因", "隔离时间", "锚点状态"]
+
+MAX_REASON_LEN = 300
+
+
+def normalize_reason(text: str | None) -> str:
+    """Validate / clean an isolation reason supplied through the web form."""
+    reason = (text or "").strip()
+    if not reason:
+        raise InputError("请填写隔离原因")
+    if len(reason) > MAX_REASON_LEN:
+        raise InputError(f"隔离原因不能超过 {MAX_REASON_LEN} 字")
+    if any(ch in reason for ch in "\r\n"):
+        raise InputError("隔离原因不能包含换行")
+    return reason
+
+
+def render_excluded(row: ExcludedReading) -> list[str]:
+    """CSV cells for one isolated reading in the quarantine file."""
+    return [
+        str(row.seq),
+        row.device_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        format_do(row.dissolved_oxygen),
+        str(row.segment + 1),
+        row.reason,
+        row.isolated_at or "",
+        "锚点已停用" if row.has_anchor else "无锚点",
+    ]

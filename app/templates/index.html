@@ -19,7 +19,9 @@
     <p class="muted">
       读数 CSV 表头 <code>序号,设备时间,溶氧</code>；核时锚点 CSV 表头 <code>序号,UTC</code>。
       设备时间在序号上不递增处自动分段；锚点采用核定时刻，同段两锚点之间按设备时间线性校时，
-      其余读数进入待核列表。设备时间与溶氧永远按原样保存，不会被校时结果覆盖。
+      其余读数进入待核列表。质控员可在批次页按原始序号隔离失真读数（如探头清洗时的溶氧），
+      隔离读数不进入日文件和待核文件，其锚点停用，但原始 CSV 与锚点记录始终保留。
+      设备时间与溶氧永远按原样保存，不会被校时结果覆盖。
     </p>
     <form method="post" action="/datasets" enctype="multipart/form-data" class="stack">
       <label>批次名称（可选）
@@ -91,7 +93,7 @@
   </section>
 </main>
 <footer class="foot">
-  <span>原始读数只读</span>·<span>发布过程原子替换，失败保留旧版</span>·<span>旧版链接内容不变</span>
+  <span>原始读数只读</span>·<span>隔离不删原始数据</span>·<span>发布过程原子替换，失败保留旧版</span>·<span>旧版链接内容不变</span>
 </footer>
 </body>
 </html>

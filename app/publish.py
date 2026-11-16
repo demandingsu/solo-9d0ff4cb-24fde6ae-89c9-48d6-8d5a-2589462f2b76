@@ -7,6 +7,7 @@ Layout on disk::
         pub-0001/
             manifest.csv
             pending.csv
+            excluded.csv        (present only when readings are isolated)
             day/2026-03-01.csv
             day/2026-03-02.csv
         pub-0002/ ...
@@ -62,7 +63,7 @@ class StagedPublication:
     staging_dir: Path
     final_dir: Path
     files: list[StagedFile]
-    counts: tuple[int, int, int]
+    counts: tuple[int, int, int, int]
 
 
 def _csv_bytes(header: list[str], rows: list[list[str]]) -> bytes:
@@ -143,12 +144,24 @@ def build_staging(
             ),
         )
 
+        if result.excluded:
+            emit(
+                "excluded",
+                None,
+                "excluded.csv",
+                _csv_bytes(
+                    core.EXCLUDED_HEADER,
+                    [core.render_excluded(r) for r in result.excluded],
+                ),
+            )
+
         manifest_rows: list[list[str]] = [
             ["修订", str(revision)],
             ["生成时间", core.iso(result.generated_at) if result.generated_at else ""],
             ["锚点数", str(len(anchors))],
             ["已校时读数", str(len(result.rows))],
             ["待核读数", str(len(result.pending))],
+            ["隔离读数", str(len(result.excluded))],
             [],
             ["文件", "日期", "字节", "SHA-256"],
         ]
@@ -169,8 +182,14 @@ def build_staging(
         final_dir = root / dir_name(dataset_id, revision)
         if final_dir.exists():
             raise PublishError(f"发布目录已存在: {final_dir}")
-        return StagedPublication(revision, staging_dir, final_dir, files,
-                                 (len(anchors), len(result.rows), len(result.pending)))
+        return StagedPublication(
+            revision,
+            staging_dir,
+            final_dir,
+            files,
+            (len(anchors), len(result.rows), len(result.pending),
+             len(result.excluded)),
+        )
     except OSError as exc:
         raise PublishError(f"写文件失败: {exc}") from exc
 
